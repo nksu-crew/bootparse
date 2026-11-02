@@ -9,6 +9,9 @@ use bootparse::{
     parse::{Block, BootImage, BootType},
 };
 
+#[cfg(feature = "unsafe")]
+use memmap2::Mmap;
+
 #[derive(serde::Serialize)]
 struct BootHeaderInfo {
     kind: &'static str,
@@ -193,7 +196,20 @@ fn extract_all(img: &BootImage, out_dir: &Path) -> Result<()> {
 
 pub fn unpack(path: impl AsRef<Path>, out_dir: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
-    let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+
+    #[cfg(feature = "unsafe")]
+    let data = unsafe { Mmap::map(&file)? };
+
+    #[cfg(not(feature = "unsafe"))]
+    let data = {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut file = file;
+        file.read_to_end(&mut buf)?;
+        buf
+    };
+
     let img =
         BootImage::parse(data.as_ref()).with_context(|| format!("parse {}", path.display()))?;
     extract_all(&img, out_dir.as_ref())
