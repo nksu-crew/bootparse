@@ -11,7 +11,7 @@ default = []
 experimental = ["dep:lzokay-native"]
 
 [dependencies]
-anyhow.workspace = true
+anyhow = "1.0.104"
 bzip2 = "0.6.1"
 flate2 = "1.1.10"
 lz4 = "1.28.1"
