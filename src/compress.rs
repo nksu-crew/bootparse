@@ -22,11 +22,12 @@ const LZ41_MAGIC: &[u8] = b"\x03\x21\x4c\x18";
 const LZ42_MAGIC: &[u8] = b"\x04\x22\x4d\x18";
 const CPIO_MAGIC: &[u8] = b"070701";
 const CPIO_CRC_MAGIC: &[u8] = b"070702";
+const DTB_MAGIC: &[u8] = b"\xd0\x0d\xfe\xed";
 
 /// Largest uncompressed size of a single legacy LZ4 block.
 const LZ4_LEGACY_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, serde::Serialize)]
 pub enum CompressFormat {
     UNKNOWN,
     GZIP,
@@ -38,6 +39,7 @@ pub enum CompressFormat {
     #[allow(non_camel_case_types)]
     LZ4_LEGACY,
     CPIO,
+    DTB,
 }
 
 /// LZMA has no real magic; `magiskboot` guesses it from the LZMA properties
@@ -71,6 +73,8 @@ pub fn parse_compress_format(data: &[u8]) -> CompressFormat {
         CompressFormat::LZMA
     } else if data.starts_with(CPIO_MAGIC) || data.starts_with(CPIO_CRC_MAGIC) {
         CompressFormat::CPIO
+    } else if data.starts_with(DTB_MAGIC) {
+        CompressFormat::DTB
     } else {
         CompressFormat::UNKNOWN
     }
@@ -125,7 +129,7 @@ pub fn compress(data: &[u8], format: CompressFormat) -> Result<Vec<u8>> {
             }
             Ok(out)
         }
-        CompressFormat::CPIO | CompressFormat::UNKNOWN => Ok(data.to_vec()),
+        CompressFormat::CPIO | CompressFormat::DTB | CompressFormat::UNKNOWN => Ok(data.to_vec()),
         #[cfg(feature = "experimental")]
         CompressFormat::LZOP => compress_lzop(data),
         #[cfg(not(feature = "experimental"))]
@@ -139,7 +143,7 @@ pub fn compress(data: &[u8], format: CompressFormat) -> Result<Vec<u8>> {
 /// returned as-is so callers can treat this as "give me the payload".
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     match parse_compress_format(data) {
-        CompressFormat::UNKNOWN | CompressFormat::CPIO => Ok(data.to_vec()),
+        CompressFormat::UNKNOWN | CompressFormat::DTB | CompressFormat::CPIO => Ok(data.to_vec()),
         CompressFormat::GZIP => {
             let mut decoder = MultiGzDecoder::new(data);
             let mut out = Vec::new();

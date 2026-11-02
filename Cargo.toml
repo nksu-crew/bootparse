@@ -9,15 +9,24 @@ description = "Android boot / vendor_boot image parser and patcher"
 [features]
 default = []
 experimental = ["dep:lzokay-native"]
+cli = ["dep:clap"]
 
 [dependencies]
 anyhow = "1.0.104"
 bzip2 = "0.6.1"
+clap = { version = "4.6.7", features = ["derive"], optional = true}
 flate2 = "1.1.10"
 lz4 = "1.28.1"
 lzma-rust2 = "0.25.0"
 lzokay-native = { version = "0.1.0", optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 zerocopy = { version = "0.8.63", features = ["derive"] }
 
 [build-dependencies]
 bindgen = "0.73.2"
+
+[[bin]]
+name = "bootp"
+path = "src/cli/main.rs"
+required-features = ["cli"]
