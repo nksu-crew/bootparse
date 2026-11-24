@@ -4,10 +4,11 @@
 //! The images are assembled here from the on-disk layout documented in the
 //! AOSP `bootimg.h`, independently of the bindgen structs the parser uses.
 
+use bootparse::BootVer;
 use bootparse::compress::{CompressFormat, compress, decompress};
 use bootparse::cpio::{Cpio, CpioEntry};
 use bootparse::parse::BootImage;
-use bootparse::patcher::VendorBootPatcher;
+use bootparse::patcher::{BootBlock, BootPatcher, VendorBootPatcher};
 
 const PAGE: usize = 4096;
 
@@ -144,6 +145,104 @@ fn build_boot_v3(kernel: &[u8], ramdisk: &[u8]) -> Vec<u8> {
     image
 }
 
+fn page_align(n: usize) -> usize {
+    (n + PAGE - 1) / PAGE * PAGE
+}
+
+/// v4 boot image with an optional AVB tail/vbmeta/footer.
+fn build_boot_v4(kernel: &[u8], ramdisk: &[u8], signature: &[u8], avb: bool) -> Vec<u8> {
+    let mut image = vec![0u8; PAGE];
+    image.extend_from_slice(kernel);
+    pad_to_page(&mut image);
+    image.extend_from_slice(ramdisk);
+    pad_to_page(&mut image);
+    image.extend_from_slice(signature);
+    pad_to_page(&mut image);
+
+    image[0..8].copy_from_slice(b"ANDROID!");
+    put_u32(&mut image, 8, kernel.len() as u32);
+    put_u32(&mut image, 12, ramdisk.len() as u32);
+    put_u32(&mut image, 20, 1584); // header_size
+    put_u32(&mut image, 40, 4); // header_version
+    put_u32(&mut image, 1580, signature.len() as u32);
+
+    if avb {
+        append_avb(&mut image, 256);
+    }
+    image
+}
+
+/// v2 boot image with every optional block populated.
+fn build_boot_v2(
+    kernel: &[u8],
+    ramdisk: &[u8],
+    second: &[u8],
+    recovery_dtbo: &[u8],
+    dtb: &[u8],
+) -> Vec<u8> {
+    let mut image = vec![0u8; PAGE];
+    image.extend_from_slice(kernel);
+    pad_to_page(&mut image);
+    image.extend_from_slice(ramdisk);
+    pad_to_page(&mut image);
+    image.extend_from_slice(second);
+    pad_to_page(&mut image);
+    let recovery_offset = image.len();
+    image.extend_from_slice(recovery_dtbo);
+    pad_to_page(&mut image);
+    image.extend_from_slice(dtb);
+    pad_to_page(&mut image);
+
+    image[0..8].copy_from_slice(b"ANDROID!");
+    put_u32(&mut image, 8, kernel.len() as u32);
+    put_u32(&mut image, 16, ramdisk.len() as u32);
+    put_u32(&mut image, 24, second.len() as u32);
+    put_u32(&mut image, 36, PAGE as u32); // page_size
+    put_u32(&mut image, 40, 2); // header_version
+    put_u32(&mut image, 1632, recovery_dtbo.len() as u32);
+    put_u64(&mut image, 1636, recovery_offset as u64);
+    put_u32(&mut image, 1644, 1664); // header_size
+    put_u32(&mut image, 1648, dtb.len() as u32);
+    image
+}
+
+/// v1 boot image with a 2048-byte page size.
+fn build_boot_v1(
+    kernel: &[u8],
+    ramdisk: &[u8],
+    second: &[u8],
+    recovery_dtbo: &[u8],
+) -> Vec<u8> {
+    const V1_PAGE: usize = 2048;
+    fn pad(buf: &mut Vec<u8>) {
+        while buf.len() % V1_PAGE != 0 {
+            buf.push(0);
+        }
+    }
+
+    let mut image = vec![0u8; V1_PAGE];
+    image.extend_from_slice(kernel);
+    pad(&mut image);
+    image.extend_from_slice(ramdisk);
+    pad(&mut image);
+    image.extend_from_slice(second);
+    pad(&mut image);
+    let recovery_offset = image.len();
+    image.extend_from_slice(recovery_dtbo);
+    pad(&mut image);
+
+    image[0..8].copy_from_slice(b"ANDROID!");
+    put_u32(&mut image, 8, kernel.len() as u32);
+    put_u32(&mut image, 16, ramdisk.len() as u32);
+    put_u32(&mut image, 24, second.len() as u32);
+    put_u32(&mut image, 36, V1_PAGE as u32); // page_size
+    put_u32(&mut image, 40, 1); // header_version
+    put_u32(&mut image, 1632, recovery_dtbo.len() as u32);
+    put_u64(&mut image, 1636, recovery_offset as u64);
+    put_u32(&mut image, 1644, 1648); // header_size
+    image
+}
+
 #[test]
 fn cpio_round_trip() {
     let archive = sample_cpio("nksu.ko\n");
@@ -276,17 +375,205 @@ fn boot_image_kernel_is_decompressed() {
 }
 
 #[test]
+fn boot_patcher_replaces_kernel_and_ramdisk() {
+    let kernel = b"kernel payload ".repeat(64);
+    let ramdisk = sample_cpio("original\n");
+    let image = build_boot_v3(
+        &compress(&kernel, CompressFormat::GZIP).unwrap(),
+        &compress(&ramdisk, CompressFormat::GZIP).unwrap(),
+    );
+
+    let replacement_kernel = b"replacement kernel ".repeat(32);
+    let replacement_ramdisk = sample_cpio("replacement\n");
+    let parsed = BootImage::parse(&image).unwrap();
+    let mut patcher = BootPatcher::new(&parsed).unwrap();
+    patcher.replace_kernel(replacement_kernel.clone());
+    patcher.replace_ramdisk(replacement_ramdisk.clone());
+    let patched = patcher.patch().unwrap();
+
+    let parsed = BootImage::parse(&patched).unwrap();
+    assert_eq!(parsed.boot_version(), Some(3));
+    let kernel = parsed.kernel().unwrap();
+    assert_eq!(kernel.format(), CompressFormat::GZIP);
+    assert_eq!(kernel.decompress().unwrap(), replacement_kernel);
+    let ramdisk = parsed.ramdisk().unwrap();
+    assert_eq!(ramdisk.format(), CompressFormat::GZIP);
+    assert_eq!(ramdisk.decompress().unwrap(), replacement_ramdisk);
+}
+
+#[test]
+fn boot_patcher_noop_reproduces_the_image() {
+    let image = build_boot_v3(
+        &compress(b"kernel", CompressFormat::GZIP).unwrap(),
+        &compress(&sample_cpio("noop\n"), CompressFormat::GZIP).unwrap(),
+    );
+    let parsed = BootImage::parse(&image).unwrap();
+    let patched = BootPatcher::new(&parsed).unwrap().patch().unwrap();
+    assert_eq!(patched, image);
+
+    let image = build_boot_v4(
+        &compress(b"kernel", CompressFormat::GZIP).unwrap(),
+        &compress(&sample_cpio("noop avb\n"), CompressFormat::GZIP).unwrap(),
+        b"signature",
+        true,
+    );
+    let parsed = BootImage::parse(&image).unwrap();
+    let patched = BootPatcher::new(&parsed).unwrap().patch().unwrap();
+    assert_eq!(patched, image);
+}
+
+#[test]
+fn boot_patcher_replaces_v2_optional_blocks() {
+    let kernel = b"kernel payload ".repeat(32);
+    let ramdisk = sample_cpio("v2\n");
+    let image = build_boot_v2(
+        &compress(&kernel, CompressFormat::GZIP).unwrap(),
+        &compress(&ramdisk, CompressFormat::GZIP).unwrap(),
+        &compress(b"second", CompressFormat::GZIP).unwrap(),
+        b"recovery-dtbo",
+        b"dtb",
+    );
+
+    let replacement_kernel = b"replacement kernel ".repeat(20);
+    let replacement_second = b"replacement second ".repeat(3);
+    let replacement_recovery = b"replacement recovery dtbo ".repeat(2);
+    let replacement_dtb = b"replacement dtb ".repeat(2);
+    let parsed = BootImage::parse(&image).unwrap();
+    let mut patcher = BootPatcher::new(&parsed).unwrap();
+    patcher.replace_kernel(replacement_kernel.clone());
+    patcher.replace_second(replacement_second.clone());
+    patcher.replace_recovery_dtbo(replacement_recovery.clone());
+    patcher.replace_dtb(replacement_dtb.clone());
+    let patched = patcher.patch().unwrap();
+
+    let parsed = BootImage::parse(&patched).unwrap();
+    assert_eq!(parsed.boot_version(), Some(2));
+    assert_eq!(
+        parsed.kernel().unwrap().decompress().unwrap(),
+        replacement_kernel
+    );
+    let boot = parsed.boot().unwrap();
+    let second = boot.blocks.second.unwrap();
+    assert_eq!(
+        bootparse::compress::parse_compress_format(second),
+        CompressFormat::GZIP
+    );
+    assert_eq!(decompress(second).unwrap(), replacement_second);
+    assert_eq!(boot.blocks.recovery_dtbo.unwrap(), replacement_recovery);
+    assert_eq!(boot.blocks.dtb.unwrap(), replacement_dtb);
+
+    // The recovery dtbo offset follows the block when earlier sizes change.
+    let header = boot.header;
+    let expected_offset = header.header_space()
+        + page_align(header.kernel_size())
+        + page_align(header.ramdisk_size())
+        + page_align(header.second_size());
+    let BootVer::V2(raw) = header else {
+        panic!("expected a v2 header");
+    };
+    let recovery_dtbo_offset = raw._base.recovery_dtbo_offset;
+    assert_eq!(recovery_dtbo_offset, expected_offset as u64);
+}
+
+#[test]
+fn boot_patcher_handles_v1_headers_and_2048_byte_pages() {
+    let image = build_boot_v1(
+        &compress(b"kernel v1", CompressFormat::GZIP).unwrap(),
+        &compress(&sample_cpio("v1\n"), CompressFormat::GZIP).unwrap(),
+        &compress(b"second v1", CompressFormat::GZIP).unwrap(),
+        b"recovery v1",
+    );
+
+    let replacement_kernel = b"replacement v1 kernel ".repeat(3);
+    let replacement_recovery = b"replacement v1 recovery ".repeat(3);
+    let parsed = BootImage::parse(&image).unwrap();
+    assert_eq!(parsed.boot_version(), Some(1));
+    let mut patcher = BootPatcher::new(&parsed).unwrap();
+    patcher.replace_kernel(replacement_kernel.clone());
+    patcher.replace_recovery_dtbo(replacement_recovery.clone());
+    let patched = patcher.patch().unwrap();
+
+    let parsed = BootImage::parse(&patched).unwrap();
+    assert_eq!(parsed.boot_version(), Some(1));
+    assert_eq!(
+        parsed.kernel().unwrap().decompress().unwrap(),
+        replacement_kernel
+    );
+    let boot = parsed.boot().unwrap();
+    assert_eq!(boot.blocks.recovery_dtbo.unwrap(), replacement_recovery);
+    assert_eq!(boot.header.page_size(), 2048);
+}
+
+#[test]
+fn boot_patcher_replaces_v4_signature_and_keeps_avb() {
+    let image = build_boot_v4(
+        &compress(b"kernel", CompressFormat::GZIP).unwrap(),
+        &compress(&sample_cpio("v4\n"), CompressFormat::GZIP).unwrap(),
+        b"signature-original",
+        true,
+    );
+
+    let replacement_kernel = b"replacement v4 kernel ".repeat(4);
+    let replacement_signature = b"signature-replacement";
+    let parsed = BootImage::parse(&image).unwrap();
+    let mut patcher = BootPatcher::new(&parsed).unwrap();
+    patcher.replace_kernel(replacement_kernel.clone());
+    patcher.replace_signature(replacement_signature.to_vec());
+    let patched = patcher.patch().unwrap();
+
+    assert_eq!(patched.len(), image.len());
+    let footer = &patched[patched.len() - 64..];
+    assert!(footer.starts_with(b"AVBf"));
+    let vbmeta_offset = u64::from_be_bytes(footer[20..28].try_into().unwrap()) as usize;
+    assert!(patched[vbmeta_offset..].starts_with(b"AVB0"));
+
+    let parsed = BootImage::parse(&patched).unwrap();
+    assert_eq!(
+        parsed.kernel().unwrap().decompress().unwrap(),
+        replacement_kernel
+    );
+    assert_eq!(
+        parsed.boot().unwrap().blocks.signature.unwrap(),
+        replacement_signature
+    );
+}
+
+#[test]
+fn boot_patcher_rejects_blocks_missing_from_the_header() {
+    let image = build_boot_v3(
+        &compress(b"kernel", CompressFormat::GZIP).unwrap(),
+        &compress(&sample_cpio("reject\n"), CompressFormat::GZIP).unwrap(),
+    );
+    let parsed = BootImage::parse(&image).unwrap();
+    let mut patcher = BootPatcher::new(&parsed).unwrap();
+    patcher.replace_dtb(b"not supported in v3".to_vec());
+    assert!(patcher.patch().is_err());
+
+    let vendor = build_vendor_boot_v3(b"ramdisk", b"dtb");
+    let parsed = BootImage::parse(&vendor).unwrap();
+    assert!(BootPatcher::new(&parsed).is_err());
+
+    let parsed = BootImage::parse(&image).unwrap();
+    let mut patcher = BootPatcher::new(&parsed).unwrap();
+    patcher.replace_block(BootBlock::Second, b"not supported in v3".to_vec());
+    assert!(patcher.patch().is_err());
+}
+
+#[test]
 fn every_supported_format_round_trips() {
     let payload = b"nekosu ramdisk payload".repeat(200);
-    for format in [
+    let mut formats = vec![
         CompressFormat::GZIP,
         CompressFormat::XZ,
         CompressFormat::LZMA,
         CompressFormat::BZIP2,
         CompressFormat::LZ4,
         CompressFormat::LZ4_LEGACY,
-        CompressFormat::LZOP,
-    ] {
+    ];
+    #[cfg(feature = "experimental")]
+    formats.push(CompressFormat::LZOP);
+
+    for format in formats {
         let compressed = compress(&payload, format).unwrap();
         assert_eq!(
             bootparse::compress::parse_compress_format(&compressed),
@@ -297,6 +584,7 @@ fn every_supported_format_round_trips() {
     }
 }
 
+#[cfg(feature = "experimental")]
 #[test]
 fn lzop_round_trips() {
     let payload = b"nekosu lzop payload ".repeat(500);
@@ -312,6 +600,7 @@ fn lzop_round_trips() {
 
 /// Cross-checks both directions against the reference `lzop` tool.  Skipped
 /// when the tool is not installed (CI only needs the self-contained tests).
+#[cfg(feature = "experimental")]
 #[test]
 fn lzop_interops_with_the_reference_tool() {
     let payload = b"nekosu lzop interop payload ".repeat(2000);

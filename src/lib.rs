@@ -4,8 +4,8 @@
 //! The image headers are generated from the AOSP `bootimg.h` with bindgen, so
 //! the on-disk layout is not re-derived by hand.  On top of that this crate
 //! provides the pieces `bootpatcher` needs: block extraction with compression
-//! detection, a newc `cpio` reader/writer and a vendor_boot repacker that
-//! preserves the vendor ramdisk table and AVB structures.
+//! detection, a newc `cpio` reader/writer and boot/vendor_boot repackers that
+//! preserve the vendor ramdisk table and AVB structures.
 pub mod boot;
 pub mod compress;
 pub mod cpio;
@@ -21,5 +21,5 @@ pub use boot::BootVer;
 pub use compress::CompressFormat;
 pub use cpio::{Cpio, CpioEntry};
 pub use parse::{Block, BootImage, BootType, get_imgtype};
-pub use patcher::VendorBootPatcher;
+pub use patcher::{BootBlock, BootPatcher, VendorBootPatcher};
 pub use vendor_boot::{VendorBootVer, VendorRamdiskEntry};
